@@ -119,15 +119,18 @@ def fetch_data(cod_loja):
                           Select
                             pr.Cod_Ean as codigo, 
                             LEFT(pr.Descricao,30) as nome, 
-                            preco1 = FORMAT(CONVERT(MONEY,ISNULL(Iif((Select top 1 Prc_Promoc from dbo.FN_ViewPoliticasProduto(po.Id_PolCom, pr.codigo ,getDate()) Where IsNull(ES.Flg_BlqVen, 0) = 0 Order by Nivel, Ordem desc)>0, 
-                                      (Select top 1 Prc_Promoc from dbo.FN_ViewPoliticasProduto(po.Id_PolCom, pr.codigo ,getDate()) Where IsNull(ES.Flg_BlqVen, 0) = 0 Order by Nivel, Ordem desc), 
-                                      ES.Prc_Venda)* 
-                                        (1-Iif((Select top 1 Per_DscVis from dbo.FN_ViewPoliticasProduto(po.Id_PolCom, pr.codigo ,getDate()) Where IsNull(ES.Flg_BlqVen, 0) = 0 Order by Nivel, Ordem desc)>0, 
+                            preco1 = FORMAT(CONVERT(MONEY, ISNULL(
+                                -- Tenta pegar a promoção primeiro, senão pega o 1º escalonamento (Nivel ASC), senão o preço base
+                                COALESCE(
+                                    (SELECT TOP 1 Prc_Promoc FROM dbo.FN_ViewPoliticasProduto(po.Id_PolCom, pr.codigo, getDate()) WHERE IsNull(ES.Flg_BlqVen, 0) = 0 AND Prc_Promoc > 0 ORDER BY Nivel, Ordem DESC),
+                                    (SELECT TOP 1 Prc_Promoc FROM dbo.FN_ViewPoliticasProduto(po.Id_PolCom, pr.codigo, getDate()) WHERE IsNull(ES.Flg_BlqVen, 0) = 0 ORDER BY Nivel ASC),
+                                    ES.Prc_Venda
+                                ) * (1-Iif((Select top 1 Per_DscVis from dbo.FN_ViewPoliticasProduto(po.Id_PolCom, pr.codigo ,getDate()) Where IsNull(ES.Flg_BlqVen, 0) = 0 Order by Nivel, Ordem desc)>0, 
                                             (Select top 1 Per_DscVis from dbo.FN_ViewPoliticasProduto(po.Id_PolCom, pr.codigo ,getDate()) Where IsNull(ES.Flg_BlqVen, 0) = 0 Order by Nivel, Ordem desc), 
                                      Iif((Select top 1 Per_Descon from dbo.FN_ViewPoliticasProduto(po.Id_PolCom, pr.codigo ,getDate()) Where IsNull(ES.Flg_BlqVen, 0) = 0 Order by Nivel, Ordem desc)>0, 
                                           (Select top 1 Per_Descon from dbo.FN_ViewPoliticasProduto(po.Id_PolCom, pr.codigo ,getDate()) Where IsNull(ES.Flg_BlqVen, 0) = 0 Order by Nivel, Ordem desc), 
                                         ES.Per_DscAut))/100),0)), 'N2', 'pt-BR'), 
-                           FORMAT(0, 'N2', 'pt-BR') as preco2 
+                           preco2 = FORMAT(ISNULL((SELECT TOP 1 Prc_Promoc FROM dbo.FN_ViewPoliticasProduto(po.Id_PolCom, pr.codigo, getDate()) WHERE IsNull(ES.Flg_BlqVen, 0) = 0 AND Prc_Promoc > 0 ORDER BY Nivel, Ordem DESC), 0), 'N2', 'pt-BR') 
                            From PRODU pr 
                           Inner Join PRXES ES on (Es.Cod_Produt = Codigo and Es.Cod_Estabe = @CodEstab) 
                           Inner Join FABRI fb on fb.Codigo = pr.Cod_Fabricante 
@@ -348,19 +351,6 @@ font_default = ("Segoe UI", 10)
 font_title = ("Segoe UI", 16, "bold")
 font_subtitle = ("Segoe UI", 12, "bold")
 font_value = ("Segoe UI", 10)
-
-# Barra superior
-# header_frame = tk.Frame(root, bg=COLORS["primary"], pady=15)
-# header_frame.pack(fill=tk.X)
-
-# lbl_title = tk.Label(
-#     header_frame,
-#     text="Gerador de Produtos • Exportação TXT",
-#     font=("Segoe UI", 16, "bold"),
-#     bg=COLORS["primary"],
-#     fg="white"
-# )
-# lbl_title.pack()
 
 # Container principal
 main_container = tk.Frame(root, bg=COLORS["bg_main"], padx=20, pady=2)
