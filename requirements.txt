@@ -1,0 +1,4 @@
+pyodbc
+schedule
+configparser
+pyinstaller

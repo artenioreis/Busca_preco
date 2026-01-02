@@ -1,0 +1,44 @@
+# Como configurar e usar o ambiente virtual e PyInstaller
+
+## Criando o ambiente virtual
+Se ainda não tiver um ambiente virtual criado, execute o seguinte comando:
+
+### Windows (CMD/Powershell):
+```
+python -m venv venv
+```
+
+### Linux/macOS:
+```
+python3 -m venv venv
+```
+
+## Ativando o ambiente virtual
+Antes de rodar o projeto, ative o ambiente virtual. No terminal, execute:
+
+### Windows (CMD/Powershell):
+```
+venv\Scripts\activate
+```
+
+### Linux/macOS:
+```
+source venv/bin/activate
+```
+
+## Instalando dependências
+Após ativar a venv, instale as dependências do projeto com:
+```
+pip install -r requirements.txt
+```
+
+## Gerando um executável com PyInstaller
+Para gerar um executável da aplicação, use:
+```
+pyinstaller --onefile --windowed job.py
+```
+
+O executável será criado na pasta `dist/`. Se precisar de mais opções, use:
+```
+pyinstaller --help
+```
