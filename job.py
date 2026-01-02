@@ -1,563 +1,431 @@
 import pyodbc
-import schedule
-import configparser
-from datetime import datetime
-import tkinter as tk
-from tkinter import messagebox, ttk
 import os
-import threading
+import json
+from datetime import datetime
 
+class GeradorArquivoGertec506E:
+    """
+    Classe responsável por gerar arquivo de produtos para Terminal Gertec 506E
+    Formato: EAN|DESCRICAO|PRECO_TOTAL|PRECO_PROMOCAO\r
+    """
 
-# Cores da interface
-COLORS = {
-    "bg_main": "#f0f2f5",
-    "bg_card": "#ffffff",
-    "primary": "#1a73e8",
-    "primary_hover": "#1557b0",
-    "success": "#34a853",
-    "text_primary": "#202124",
-    "text_secondary": "#5f6368",
-    "border": "#dadce0",
-    "debug": "#a84e3b",
-    "debug1": "#70f027",
-}
+    def __init__(self, connection_string):
+        """
+        Inicializa a conexão com o banco de dados
+        """
+        self.conn = None
+        self.cursor = None
+        try:
+            self.conn = pyodbc.connect(connection_string)
+            self.cursor = self.conn.cursor()
+            print("✓ Conexão estabelecida com sucesso!")
+        except Exception as e:
+            print(f"✗ Erro ao conectar ao banco: {str(e)}")
+            raise
 
-# Variáveis globais
-server = ""
-database = ""
-username = "VMDApp"
-password = "VMD22041748"
-cod_loja = ""
-cod_cliente = 0
-cod_politica = 0
-sistema = "VAREJO"
-X_MINUTOS = 0
-last_run_time = None
-running_job = False
+    def buscar_produtos_com_precos(self, id_polcom, cod_cli, cod_estab):
+        """
+        Busca todos os produtos com preços calculados usando a política comercial
 
-def load_config():
-    """Carrega as configurações de um arquivo INI e inicializa as variáveis globais."""
-    global server, database, username, password, cod_loja, X_MINUTOS, cod_cliente, cod_politica, sistema
+        Args:
+            id_polcom: ID da Política Comercial
+            cod_cli: Código do Cliente
+            cod_estab: Código do Estabelecimento
 
-    config = configparser.ConfigParser()
-    
-    # Verifica se o arquivo config.ini existe, se não, cria com valores padrão
-    if not os.path.exists("config.ini"):
-        config['CONFIG'] = {
-            'SERVER': 'localhost',
-            'DATABASE': 'sua_base_de_dados',
-            'INTERVALO_MINUTOS': '5',
-            'COD_LOJA': '1',
-            'SISTEMA': 'VAREJO', # ou ATACADO
-            'CLIENTE': '0', # Apenas para ATACADO
-            'IDPOLCOM': '0' # Apenas para ATACADO
+        Returns:
+            list: Lista de dicionários com os dados dos produtos
+        """
+        query = """
+        -- Parâmetros da política comercial
+        DECLARE @IdPolCom INT = ?; 
+        DECLARE @CodCli INT = ?;    
+        DECLARE @CodEstab INT = ?;      
+
+        SELECT
+            pr.Cod_Ean AS [Código EAN], 
+            LEFT(pr.Descricao, 30) AS [Nome Produto],
+
+            -- Preço Base da Filial
+            ES.Prc_Venda AS [Preço Base],
+
+            -- Valor da Promoção (Se houver Prc_Promoc > 0 no escalonamento)
+            (SELECT TOP 1 Prc_Promoc 
+             FROM dbo.FN_ViewPoliticasProduto(@IdPolCom, pr.Codigo, GETDATE())
+             WHERE IsNull(ES.Flg_BlqVen, 0) = 0 AND Prc_Promoc > 0 
+             ORDER BY Nivel, Ordem DESC) AS [Valor Promoção],
+
+            -- Primeiro Escalonamento (Preço por quantidade/nível 1)
+            (SELECT TOP 1 Prc_Promoc 
+             FROM dbo.FN_ViewPoliticasProduto(@IdPolCom, pr.Codigo, GETDATE())
+             WHERE IsNull(ES.Flg_BlqVen, 0) = 0 
+             ORDER BY Nivel ASC) AS [1º Escalonamento],
+
+            -- Preço Final calculado (Lógica: Promoção > Escalonamento > Venda)
+            ISNULL(
+                COALESCE(
+                    (SELECT TOP 1 Prc_Promoc FROM dbo.FN_ViewPoliticasProduto(@IdPolCom, pr.Codigo, GETDATE()) 
+                     WHERE IsNull(ES.Flg_BlqVen, 0) = 0 AND Prc_Promoc > 0 ORDER BY Nivel, Ordem DESC),
+                    (SELECT TOP 1 Prc_Promoc FROM dbo.FN_ViewPoliticasProduto(@IdPolCom, pr.Codigo, GETDATE()) 
+                     WHERE IsNull(ES.Flg_BlqVen, 0) = 0 ORDER BY Nivel ASC),
+                    ES.Prc_Venda
+                ) * (1 - ISNULL((SELECT TOP 1 Per_DscVis FROM dbo.FN_ViewPoliticasProduto(@IdPolCom, pr.Codigo, GETDATE()) 
+                                 WHERE IsNull(ES.Flg_BlqVen, 0) = 0 ORDER BY Nivel, Ordem DESC), 0) / 100)
+            , 0) AS [Preço Final],
+
+            -- Dados adicionais da tabela PREAN
+            PREAN.Cod_Produt,
+            PREAN.Tip_Cod,
+            PREAN.Qtd_UndEmb,
+            PREAN.Des_UndEmb,
+            ISNULL(PREAN.Qtd_FraVen, 1) AS Qtd_FraVen,
+            PREAN.Pes_Emb,
+            PREAN.Alt_Emb,
+            PREAN.Lrg_Emb,
+            PREAN.Prf_Emb,
+            PREAN.Qtd_EmbPalete,
+            PREAN.Qtd_CamPalete,
+            PREAN.Vol_Emb
+
+        FROM PRODU pr 
+        INNER JOIN PRXES ES ON (ES.Cod_Produt = pr.Codigo AND ES.Cod_Estabe = @CodEstab)
+        LEFT JOIN PREAN ON (PREAN.Cod_EAN = pr.Cod_Ean)
+        WHERE ISNULL(pr.Cod_Ean, '') != ''
+        ORDER BY pr.Descricao ASC;
+        """
+
+        print(f"\n🔍 Buscando produtos...")
+        print(f"   Política Comercial: {id_polcom}")
+        print(f"   Cliente: {cod_cli}")
+        print(f"   Estabelecimento: {cod_estab}")
+
+        self.cursor.execute(query, (id_polcom, cod_cli, cod_estab))
+        colunas = [column[0] for column in self.cursor.description]
+
+        resultados = []
+        for row in self.cursor.fetchall():
+            resultados.append(dict(zip(colunas, row)))
+
+        print(f"✓ {len(resultados)} produtos encontrados")
+        return resultados
+
+    def calcular_preco_com_quantidade(self, produto):
+        """
+        Calcula o preço multiplicado pela Qtd_FraVen
+
+        Lógica:
+        - Se Qtd_FraVen > 0: Preço * Qtd_FraVen (ex: 25.90 * 60 = 1554.00)
+        - Se Qtd_FraVen = 0 ou NULL: Preço * 1 (preço unitário)
+
+        Prioridade de preço: Valor Promoção > 1º Escalonamento > Preço Final
+
+        Args:
+            produto: Dicionário com os dados do produto
+
+        Returns:
+            tuple: (preco_unitario, quantidade, preco_total, tipo_preco)
+        """
+        # Obtém a quantidade (padrão 1 se não houver)
+        qtd_fravem = produto.get('Qtd_FraVen', 1)
+        if qtd_fravem is None or qtd_fravem <= 0:
+            qtd_fravem = 1
+
+        # Define o preço unitário (prioridade: Promoção > Escalonamento > Final)
+        valor_promocao = produto.get('Valor Promoção')
+        primeiro_escalonamento = produto.get('1º Escalonamento')
+        preco_final = produto.get('Preço Final', 0)
+
+        if valor_promocao and valor_promocao > 0:
+            preco_unitario = float(valor_promocao)
+            tipo_preco = "PROMOÇÃO"
+        elif primeiro_escalonamento and primeiro_escalonamento > 0:
+            preco_unitario = float(primeiro_escalonamento)
+            tipo_preco = "ESCALONAMENTO"
+        else:
+            preco_unitario = float(preco_final) if preco_final else 0.0
+            tipo_preco = "NORMAL"
+
+        # Calcula o preço total
+        preco_total = preco_unitario * qtd_fravem
+
+        return preco_unitario, qtd_fravem, preco_total, tipo_preco
+
+    def gerar_arquivo_output_pipe(self, dados, nome_arquivo='output.txt', pasta_destino='saida_gertec'):
+        """
+        Gera arquivo no formato exato solicitado:
+        EAN|DESCRICAO|PRECO_TOTAL|PRECO_PROMOCAO\r
+
+        Exemplo:
+        9555002100025|LUVAS P/PROCED SUPERMAX "P" C/|23,17|0,00
+        9500007254433|COLETOR KIT URINA TUBO 12ML+BA|0,00|0,00
+
+        Args:
+            dados: Lista de dicionários com os dados dos produtos
+            nome_arquivo: Nome do arquivo a ser gerado
+            pasta_destino: Pasta onde o arquivo será salvo
+
+        Returns:
+            str: Caminho do arquivo gerado
+        """
+        if not os.path.exists(pasta_destino):
+            os.makedirs(pasta_destino)
+
+        caminho_arquivo = os.path.join(pasta_destino, nome_arquivo)
+
+        try:
+            total_processados = 0
+            com_preco = 0
+            sem_preco = 0
+
+            with open(caminho_arquivo, 'w', encoding='latin-1') as f:
+
+                for produto in dados:
+                    total_processados += 1
+
+                    # Extrai EAN e Descrição
+                    ean = str(produto.get('Código EAN', '')).strip()
+                    descricao = str(produto.get('Nome Produto', '')).strip()[:30]
+
+                    # Valida se tem código EAN
+                    if not ean or ean == '':
+                        continue
+
+                    # Calcula preços
+                    preco_unitario, qtd, preco_total, tipo_preco = self.calcular_preco_com_quantidade(produto)
+
+                    # Obtém o valor da promoção real
+                    valor_promocao = produto.get('Valor Promoção') or 0.0
+
+                    # Formata números com vírgula (padrão PT-BR)
+                    preco_total_fmt = f"{preco_total:.2f}".replace('.', ',')
+                    preco_promocao_fmt = f"{valor_promocao:.2f}".replace('.', ',')
+
+                    # Contabiliza
+                    if preco_total > 0:
+                        com_preco += 1
+                    else:
+                        sem_preco += 1
+
+                    # Monta a linha EXATAMENTE conforme solicitado
+                    # Formato: EAN|DESCRICAO|PRECO_TOTAL|PRECO_PROMOCAO\r
+                    linha = f"{ean}|{descricao}|{preco_total_fmt}|{preco_promocao_fmt}\r"
+
+                    f.write(linha)
+
+            print(f"\n{'='*70}")
+            print(f"✓ Arquivo gerado: {caminho_arquivo}")
+            print(f"\n📊 Estatísticas:")
+            print(f"   Total de produtos processados: {total_processados}")
+            print(f"   Produtos com preço: {com_preco}")
+            print(f"   Produtos sem preço: {sem_preco}")
+            print(f"{'='*70}")
+
+            return caminho_arquivo
+
+        except Exception as e:
+            print(f"✗ Erro ao gerar arquivo output.txt: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            return None
+
+    def processar_arquivo_gertec(self):
+        """
+        Processa todos os dados e gera o arquivo output.txt
+        Solicita os parâmetros da política comercial
+
+        Returns:
+            dict: Estatísticas do processamento
+        """
+        print("\n" + "="*70)
+        print("GERAÇÃO DE ARQUIVO PARA TERMINAL GERTEC 506E - BUSCA PREÇO")
+        print("="*70)
+
+        # Solicita os parâmetros
+        print("\n📋 Informe os parâmetros da Política Comercial:")
+        try:
+            id_polcom = int(input("ID da Política Comercial [432]: ").strip() or "432")
+            cod_cli = int(input("Código do Cliente [164]: ").strip() or "164")
+            cod_estab = int(input("Código do Estabelecimento [0]: ").strip() or "0")
+        except ValueError:
+            print("✗ Valores inválidos! Usando valores padrão.")
+            id_polcom = 432
+            cod_cli = 164
+            cod_estab = 0
+
+        inicio = datetime.now()
+
+        # Busca os dados
+        dados = self.buscar_produtos_com_precos(id_polcom, cod_cli, cod_estab)
+
+        if not dados:
+            print("⚠ Nenhum produto encontrado!")
+            return None
+
+        # Gera o arquivo output.txt
+        print("\n📄 Gerando arquivo output.txt...")
+        arquivo_gerado = self.gerar_arquivo_output_pipe(dados)
+
+        fim = datetime.now()
+        tempo_decorrido = (fim - inicio).total_seconds()
+
+        estatisticas = {
+            'total_produtos': len(dados),
+            'arquivo_gerado': arquivo_gerado,
+            'tempo_segundos': tempo_decorrido,
+            'id_polcom': id_polcom,
+            'cod_cli': cod_cli,
+            'cod_estab': cod_estab
         }
-        with open("config.ini", 'w') as configfile:
-            config.write(configfile)
-        messagebox.showinfo("Arquivo de Configuração Criado", "O arquivo 'config.ini' não foi encontrado e foi criado com valores padrão. Por favor, edite-o com suas configurações.")
 
-    config.read("config.ini")
-    try:
-        server = config.get("CONFIG", "SERVER")
-        database = config.get("CONFIG", "DATABASE")
-        X_MINUTOS = config.getint("CONFIG", "INTERVALO_MINUTOS")
-        cod_loja = config.get("CONFIG", "COD_LOJA")
-        sistema = config.get("CONFIG", "SISTEMA", fallback="VAREJO")
-        
-        if sistema == "ATACADO":
-            cod_cliente = config.get("CONFIG", "CLIENTE")
-            cod_politica = config.get("CONFIG", "IDPOLCOM")
-            username = "DMDApp"
-            password = "DMD20051643"
+        print(f"\n⏱ Tempo total de processamento: {tempo_decorrido:.2f} segundos\n")
 
-        
-    except Exception as e:
-        messagebox.showerror("Erro de Configuração", f"Erro ao carregar configurações: {e}")
-        exit(1)
+        return estatisticas
 
-def connect_to_database():
-    """Estabelece uma conexão com o banco de dados SQL Server."""
-    try:
-        connection = pyodbc.connect(
-            f"DRIVER={{ODBC Driver 17 for SQL Server}};"
-            f"SERVER={server};"
-            f"DATABASE={database};"
-            f"UID={username};"
-            f"PWD={password};"
-        )
-        return connection
-    except Exception as e:
+    def fechar_conexao(self):
+        """
+        Fecha a conexão com o banco de dados
+        """
+        if self.cursor:
+            self.cursor.close()
+        if self.conn:
+            self.conn.close()
+
+
+class ConfiguracaoBanco:
+    """
+    Gerencia as configurações de conexão ao banco de dados
+    """
+
+    ARQUIVO_CONFIG = 'config_banco.json'
+
+    @staticmethod
+    def carregar_configuracao():
+        """
+        Carrega a configuração salva do arquivo
+
+        Returns:
+            dict: Configurações do banco ou None se não existir
+        """
+        if os.path.exists(ConfiguracaoBanco.ARQUIVO_CONFIG):
+            try:
+                with open(ConfiguracaoBanco.ARQUIVO_CONFIG, 'r') as f:
+                    return json.load(f)
+            except:
+                return None
         return None
 
-def fetch_data(cod_loja):
-    """Executa a consulta SQL e retorna os resultados."""
-    if sistema == "VAREJO":
-        query = f"""
-        SELECT
-            PREAN.Cod_Ean as codigo,
-            LEFT(PRODU.Des_Produt,30) as nome,
-            FORMAT(ISNULL(PRXLJ.Prc_VenAtu,0),'N2','pt-BR') as preco1,
-            FORMAT(ISNULL(PRMIT.Prc_Promoc,0),'N2','pt-BR') as preco2
-        FROM PREAN
-            INNER JOIN PRODU
-                ON PREAN.Cod_Produt = PRODU.Cod_Produt
-            INNER JOIN PRXLJ
-                ON PREAN.Cod_Produt = PRXLJ.Cod_Produt
-                AND PRXLJ.Cod_Loja={cod_loja}
-            LEFT JOIN PRMIT
-                ON PRXLJ.Cod_PrmAtv = PRMIT.Cod_Promoc
-                AND PRXLJ.Cod_Produt = PRMIT.Cod_Produt
-                AND PRXLJ.Cod_loja = PRMIT.Cod_loja
-        ORDER BY 2
+    @staticmethod
+    def salvar_configuracao(config):
         """
-    else: 
-        query = f"""
-        Declare @IdPolCom Int,@CodCli Int, @CodEstab Int 
-                          set @IdPolCom = {cod_politica}
-                          set @CodCli = {cod_cliente}
-                          set @CodEstab = {cod_loja}
-                          Select
-                            pr.Cod_Ean as codigo, 
-                            LEFT(pr.Descricao,30) as nome, 
-                            preco1 = FORMAT(CONVERT(MONEY, ISNULL(
-                                -- Tenta pegar a promoção primeiro, senão pega o 1º escalonamento (Nivel ASC), senão o preço base
-                                COALESCE(
-                                    (SELECT TOP 1 Prc_Promoc FROM dbo.FN_ViewPoliticasProduto(po.Id_PolCom, pr.codigo, getDate()) WHERE IsNull(ES.Flg_BlqVen, 0) = 0 AND Prc_Promoc > 0 ORDER BY Nivel, Ordem DESC),
-                                    (SELECT TOP 1 Prc_Promoc FROM dbo.FN_ViewPoliticasProduto(po.Id_PolCom, pr.codigo, getDate()) WHERE IsNull(ES.Flg_BlqVen, 0) = 0 ORDER BY Nivel ASC),
-                                    ES.Prc_Venda
-                                ) * (1-Iif((Select top 1 Per_DscVis from dbo.FN_ViewPoliticasProduto(po.Id_PolCom, pr.codigo ,getDate()) Where IsNull(ES.Flg_BlqVen, 0) = 0 Order by Nivel, Ordem desc)>0, 
-                                            (Select top 1 Per_DscVis from dbo.FN_ViewPoliticasProduto(po.Id_PolCom, pr.codigo ,getDate()) Where IsNull(ES.Flg_BlqVen, 0) = 0 Order by Nivel, Ordem desc), 
-                                     Iif((Select top 1 Per_Descon from dbo.FN_ViewPoliticasProduto(po.Id_PolCom, pr.codigo ,getDate()) Where IsNull(ES.Flg_BlqVen, 0) = 0 Order by Nivel, Ordem desc)>0, 
-                                          (Select top 1 Per_Descon from dbo.FN_ViewPoliticasProduto(po.Id_PolCom, pr.codigo ,getDate()) Where IsNull(ES.Flg_BlqVen, 0) = 0 Order by Nivel, Ordem desc), 
-                                        ES.Per_DscAut))/100),0)), 'N2', 'pt-BR'), 
-                           preco2 = FORMAT(ISNULL((SELECT TOP 1 Prc_Promoc FROM dbo.FN_ViewPoliticasProduto(po.Id_PolCom, pr.codigo, getDate()) WHERE IsNull(ES.Flg_BlqVen, 0) = 0 AND Prc_Promoc > 0 ORDER BY Nivel, Ordem DESC), 0), 'N2', 'pt-BR') 
-                           From PRODU pr 
-                          Inner Join PRXES ES on (Es.Cod_Produt = Codigo and Es.Cod_Estabe = @CodEstab) 
-                          Inner Join FABRI fb on fb.Codigo = pr.Cod_Fabricante 
-                          Left Join SBBAS sb on sb.Codigo = pr.Cod_SubBas  
-                          left join (
-                          select p.Id_PolCom  
-                                from POCOM p  
-                                      Inner Join PCXES pe on ((p.Id_PolCom = pe.Id_PolCom) and (pe.Cod_Estabe = @CodEstab))  
-                                      Left Join TBPRC tb on ((tb.Cod_Estabe = @CodEstab) or (tb.Flg_AllEstabe = 1)) and  
-                                                            (p.Cod_TabPrc = tb.Cod_TabPrc)  
-                                      Left Join TPXPR tp on ( (tb.Cod_Estabe = tp.Cod_Estabe) and (tb.Cod_TabPrc = tp.Cod_TabPrc) and (tp.Cod_Produt = Cod_Produt) )  
-                                      Left Join CLIEN cl on cl.Codigo = @CodCli 
-                                      Left Join PCXCL pc on ((p.Id_PolCom = pc.Id_PolCom) and (pc.Cod_Client = cl.Codigo))  
-                                      Left Join PCXGC pg on ((p.Id_PolCom = pg.Id_PolCom) and (pg.Cod_GrpCli = cl.Cod_GrpCli))   
-                                      Left Join PCXUF pu on ((p.Id_PolCom = pu.Id_PolCom) and (pu.Cod_Uf = cl.Cod_Estado))  
-                                  where ((pc.Cod_Client > 0) or (pg.Cod_GrpCli > 0) or (pu.Cod_Uf <> ''))  
-                                    and dbo.FN_TransacaoAtiva(p.Dat_Inicio, p.Dat_Termino, getDate(), p.Bloqueado) = 1 
-                                    and Substring(IsNull(p.Tip_PolCom,''),3,1) <> 'K'  
-                                    and ((p.Flg_BlqCli = 0) or ((p.Flg_BlqCli = 1) and (IsNull(cl.Flg_BlqPrm,0) = 0))) 
-                                    and p.Flg_Balcao = 1 
-                          ) po on po.Id_PolCom = @IdPolCom 
-                          where isnull(cod_ean,'') != ''
-                          ORDER BY 1 desc
+        Salva a configuração no arquivo
+
+        Args:
+            config: Dicionário com as configurações
         """
-    connection = connect_to_database()
-    if not connection:
-        return []
+        with open(ConfiguracaoBanco.ARQUIVO_CONFIG, 'w') as f:
+            json.dump(config, f, indent=4)
+        print(f"✓ Configurações salvas em {ConfiguracaoBanco.ARQUIVO_CONFIG}")
 
-    try:
-        cursor = connection.cursor()
-        cursor.execute(query)
-        rows = cursor.fetchall()
-        connection.close()
-        return rows
-    except Exception as e:
-        return []
+    @staticmethod
+    def solicitar_dados_conexao():
+        """
+        Solicita os dados de conexão ao usuário
 
-def create_txt_file(data):
-    """Cria um arquivo TXT com os dados formatados."""
-    filename = "output.txt"
-    try:
-        with open(filename, "w") as file:
-            for row in data:
-                line = f"{row.codigo}|{row.nome}|{row.preco1}|{row.preco2}\n"
-                file.write(line)
-        return True
-    except Exception as e:
-        return False
+        Returns:
+            dict: Dicionário com os dados de conexão
+        """
+        print("\n" + "="*70)
+        print("CONFIGURAÇÃO DE CONEXÃO AO BANCO DE DADOS")
+        print("="*70)
 
-def job(cod_loja=None):
-    """Função agendada para rodar o processo completo."""
-    global last_run_time, running_job
-    
-    if running_job:
-        return
-        
-    running_job = True
-    update_status("Conectando ao banco de dados...")
-    
-    # Se não for especificado, usa o valor global
-    if cod_loja is None:
-        cod_loja = globals()['cod_loja']
-        
-    # Atualiza status de execução
-    progress_bar.start(10)
-    progress_value.set(25)
-    root.update_idletasks()
-    
-    update_status("Consultando produtos...")
-    data = fetch_data(cod_loja)
-    
-    if data:
-        progress_value.set(75)
-        update_status(f"Processando {len(data)} produtos...")
-        root.update_idletasks()
-        
-        if create_txt_file(data):
-            last_run_time = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
-            progress_value.set(100)
-            update_status(f"Concluído! {len(data)} produtos exportados.")
-            update_ui()
+        servidor = input("Servidor SQL: ").strip()
+        banco = input("Nome do Banco: ").strip()
+
+        print("\nTipo de autenticação:")
+        print("1 - Windows (Autenticação Integrada)")
+        print("2 - SQL Server (Usuário e Senha)")
+        tipo_auth = input("Escolha (1 ou 2): ").strip()
+
+        config = {
+            'servidor': servidor,
+            'banco': banco,
+            'tipo_auth': tipo_auth
+        }
+
+        if tipo_auth == '2':
+            usuario = input("Usuário: ").strip()
+            senha = input("Senha: ").strip()
+            config['usuario'] = usuario
+            config['senha'] = senha
+
+        return config
+
+    @staticmethod
+    def criar_connection_string(config):
+        """
+        Cria a string de conexão a partir da configuração
+
+        Args:
+            config: Dicionário com as configurações
+
+        Returns:
+            str: String de conexão
+        """
+        if config['tipo_auth'] == '1':
+            return f"DRIVER={{SQL Server}};SERVER={config['servidor']};DATABASE={config['banco']};Trusted_Connection=yes;"
         else:
-            update_status("Erro ao criar arquivo de saída!")
-    else:
-        update_status("Erro na consulta ou nenhum dado retornado.")
-    
-    progress_bar.stop()
-    running_job = False
+            return f"DRIVER={{SQL Server}};SERVER={config['servidor']};DATABASE={config['banco']};UID={config['usuario']};PWD={config['senha']}"
 
-def update_ui():
-    """Atualiza os elementos da interface gráfica."""
-    config_text = f"{sistema}"
-    
-    if sistema == "VAREJO":
-        config_text += f" • Loja {cod_loja}"
-    else:
-        config_text += f" • Estabelecimento {cod_loja}"
-        config_text += f" • Cliente {cod_cliente}"
-        config_text += f" • Política {cod_politica}"
-    
-    lbl_config_value.config(text=config_text)
-    lbl_server_value.config(text=f"{server}")
-    lbl_database_value.config(text=f"{database}")
-    lbl_interval_value.config(text=f"A cada {X_MINUTOS} minutos")
-    
-    if last_run_time:
-        lbl_last_run_value.config(text=last_run_time)
-        lbl_status_icon.config(text="✓", fg=COLORS["success"])
-    else:
-        lbl_last_run_value.config(text="Ainda não executado")
-        lbl_status_icon.config(text="◯", fg=COLORS["text_secondary"])
 
-def manual_job():
-    """Executa o job manualmente em uma thread separada."""
-    if running_job:
-        messagebox.showinfo("Aviso", "Um processo já está em execução!")
-        return
-        
-    threading.Thread(target=job).start()
+def main():
+    """
+    Função principal que gerencia o fluxo do programa
+    """
+    gerador = None
 
-def update_status(message):
-    """Atualiza a mensagem de status na interface."""
-    lbl_status.config(text=message)
-    root.update_idletasks()
+    try:
+        # Carrega ou solicita configuração
+        config = ConfiguracaoBanco.carregar_configuracao()
 
-def test_connection():
-    """Testa a conexão com o banco de dados."""
-    update_status("Testando conexão...")
-    connection = connect_to_database()
-    if connection:
-        connection.close()
-        messagebox.showinfo("Conexão", "Conexão com o banco de dados estabelecida com sucesso!")
-        update_status("Conexão bem-sucedida.")
-    else:
-        messagebox.showerror("Erro de Conexão", "Não foi possível conectar ao banco de dados!")
-        update_status("Falha na conexão.")
+        if config is None:
+            print("\n⚠ Primeira execução detectada!")
+            config = ConfiguracaoBanco.solicitar_dados_conexao()
 
-def create_custom_button(parent, text, command, **kwargs):
-    """Cria um botão personalizado com efeitos de hover."""
-    style = kwargs.get("style", "primary")
-    width = kwargs.get("width", 150)
-    
-    if style == "primary":
-        bg_color = COLORS["primary"]
-        hover_color = COLORS["primary_hover"]
-        fg_color = "white"
-    else:
-        bg_color = COLORS["bg_card"]
-        hover_color = COLORS["border"]
-        fg_color = COLORS["text_primary"]
-    
-    button = tk.Button(
-        parent,
-        text=text,
-        command=command,
-        bg=bg_color,
-        fg=fg_color,
-        relief=tk.FLAT,
-        width=width // 10,  # Ajusta para unidades de texto
-        pady=8,
-        cursor="hand2",
-        font=("Segoe UI", 9)
-        
-    )
-    
-    def on_enter(e):
-        button['background'] = hover_color
-        
-    def on_leave(e):
-        button['background'] = bg_color
-        
-    button.bind("<Enter>", on_enter)
-    button.bind("<Leave>", on_leave)
-    
-    return button
+            # Testa a conexão
+            print("\nTestando conexão...")
+            connection_string = ConfiguracaoBanco.criar_connection_string(config)
 
-def create_card(parent, title, **kwargs):
-    """Cria um card com título e conteúdo."""
-    card = tk.Frame(
-        parent,
-        bg=COLORS["bg_card"],
-        highlightbackground=COLORS["border"],
-        highlightthickness=1,
-        padx=15,
-        pady=2
-    )
-    
-    if title:
-        lbl_title = tk.Label(
-            card,
-            text=title,
-            font=("Segoe UI", 10, "bold"),
-            bg=COLORS["bg_card"],
-            fg=COLORS["text_primary"]
-        )
-        lbl_title.pack(anchor="w", pady=(4, 4))
-    
-    return card
+            try:
+                teste_conn = pyodbc.connect(connection_string)
+                teste_conn.close()
+                print("✓ Conexão testada com sucesso!")
+                ConfiguracaoBanco.salvar_configuracao(config)
+            except Exception as e:
+                print(f"\n✗ Erro ao testar conexão: {str(e)}")
+                print("\nVerifique os dados informados e tente novamente.")
+                return
+        else:
+            print("✓ Configuração carregada do arquivo")
+            connection_string = ConfiguracaoBanco.criar_connection_string(config)
 
-def scheduler_loop():
-    """Executa o agendador periodicamente."""
-    schedule.run_pending()
-    root.after(1000, scheduler_loop)
+        # Cria o gerador e processa
+        gerador = GeradorArquivoGertec506E(connection_string)
+        gerador.processar_arquivo_gertec()
 
-# Carrega configurações no início
-load_config()
-schedule.every(X_MINUTOS).minutes.do(lambda: threading.Thread(target=job).start())
+        print("\n✅ Processo concluído com sucesso!")
+        print("📁 Arquivo pronto para uso:")
+        print("   • output.txt - Arquivo para Terminal Gertec 506E")
 
-# Criação da interface gráfica
-root = tk.Tk()
-root.title("Gerador de Produtos • Exportação TXT")
-root.geometry("500x500")
-root.configure(bg=COLORS["bg_main"])
-root.resizable(False, False)
+    except KeyboardInterrupt:
+        print("\n\n⚠ Operação cancelada pelo usuário")
+    except Exception as e:
+        print(f"\n✗ Erro fatal: {str(e)}")
+        import traceback
+        traceback.print_exc()
+    finally:
+        if gerador is not None:
+            gerador.fechar_conexao()
+            print("\n✓ Conexão fechada")
 
-# Configurar fonte padrão
-font_default = ("Segoe UI", 10)
-font_title = ("Segoe UI", 16, "bold")
-font_subtitle = ("Segoe UI", 12, "bold")
-font_value = ("Segoe UI", 10)
 
-# Container principal
-main_container = tk.Frame(root, bg=COLORS["bg_main"], padx=20, pady=2)
-main_container.pack(fill=tk.BOTH, expand=True)
-
-# Card das informações de conexão
-conn_card = create_card(main_container, "Configurações")
-conn_card.pack(fill=tk.X, pady=2)
-
-# Grid de informações
-info_frame = tk.Frame(conn_card, bg=COLORS["bg_card"])
-info_frame.pack(fill=tk.X)
-
-# Primeira coluna - informações de conexão
-conn_col = tk.Frame(info_frame, bg=COLORS["bg_card"], padx=10)
-conn_col.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-
-# Servidor
-lbl_server = tk.Label(
-    conn_col,
-    text="Servidor:",
-    font=font_default,
-    bg=COLORS["bg_card"],
-    fg=COLORS["text_secondary"]
-)
-lbl_server.grid(row=0, column=0, sticky="w", pady=3)
-
-lbl_server_value = tk.Label(
-    conn_col,
-    text=server,
-    font=font_value,
-    bg=COLORS["bg_card"],
-    fg=COLORS["text_primary"]
-)
-lbl_server_value.grid(row=0, column=1, sticky="w", padx=10, pady=3)
-
-# Banco de dados
-lbl_database = tk.Label(
-    conn_col,
-    text="Banco de dados:",
-    font=font_default,
-    bg=COLORS["bg_card"],
-    fg=COLORS["text_secondary"]
-)
-lbl_database.grid(row=1, column=0, sticky="w", pady=3)
-
-lbl_database_value = tk.Label(
-    conn_col,
-    text=database,
-    font=font_value,
-    bg=COLORS["bg_card"],
-    fg=COLORS["text_primary"]
-)
-lbl_database_value.grid(row=1, column=1, sticky="w", padx=10, pady=3)
-
-# Segunda coluna - informações de configuração
-config_col = tk.Frame(info_frame, bg=COLORS["bg_card"], padx=10)
-config_col.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-
-# Configuração
-lbl_config = tk.Label(
-    conn_col,
-    text="Sistema:",
-    font=font_default,
-    bg=COLORS["bg_card"],
-    fg=COLORS["text_secondary"]
-)
-lbl_config.grid(row=2, column=0, sticky="w", pady=3)
-
-lbl_config_value = tk.Label(
-    conn_col,
-    text=f"{sistema} • Loja {cod_loja}",
-    font=font_value,
-    bg=COLORS["bg_card"],
-    fg=COLORS["text_primary"]
-)
-lbl_config_value.grid(row=2, column=1, sticky="w", padx=10, pady=3)
-
-# Intervalo
-lbl_interval = tk.Label(
-    conn_col,
-    text="Intervalo:",
-    font=font_default,
-    bg=COLORS["bg_card"],
-    fg=COLORS["text_secondary"]
-)
-lbl_interval.grid(row=3, column=0, sticky="w", pady=3)
-
-lbl_interval_value = tk.Label(
-    conn_col,
-    text=f"A cada {X_MINUTOS} minutos",
-    font=font_value,
-    bg=COLORS["bg_card"],
-    fg=COLORS["text_primary"]
-)
-lbl_interval_value.grid(row=3, column=1, sticky="w", padx=10, pady=3)
-
-# Botão de teste de conexão
-btn_test = create_custom_button(
-    conn_card,
-    "Testar Conexão",
-    test_connection,
-    style="secondary",
-    width=120
-)
-btn_test.pack(anchor="e", pady=(15, 0))
-
-# Card de status e operações
-status_card = create_card(main_container, "Status da Execução")
-status_card.pack(fill=tk.X, pady=10)
-
-# Status de última execução
-status_frame = tk.Frame(status_card, bg=COLORS["bg_card"])
-status_frame.pack(fill=tk.X, pady=(0, 10))
-
-# Ícone de status
-lbl_status_icon = tk.Label(
-    status_frame,
-    text="◯",
-    font=("Segoe UI", 20),
-    bg=COLORS["bg_card"],
-    fg=COLORS["text_secondary"]
-)
-lbl_status_icon.pack(side=tk.LEFT, padx=(0, 10))
-
-# Container de última execução
-last_run_container = tk.Frame(status_frame, bg=COLORS["bg_card"])
-last_run_container.pack(side=tk.LEFT, fill=tk.X)
-
-lbl_last_run = tk.Label(
-    last_run_container,
-    text="Última execução:",
-    font=font_default,
-    bg=COLORS["bg_card"],
-    fg=COLORS["text_secondary"]
-)
-lbl_last_run.pack(anchor="w")
-
-lbl_last_run_value = tk.Label(
-    last_run_container,
-    text="Ainda não executado",
-    font=font_value,
-    bg=COLORS["bg_card"],
-    fg=COLORS["text_primary"]
-)
-lbl_last_run_value.pack(anchor="w")
-
-# Barra de progresso
-progress_frame = tk.Frame(status_card, bg=COLORS["bg_card"], pady=10)
-progress_frame.pack(fill=tk.X)
-
-progress_value = tk.IntVar(value=0)
-progress_bar = ttk.Progressbar(
-    progress_frame,
-    orient="horizontal",
-    length=200,
-    mode="determinate",
-    variable=progress_value
-)
-progress_bar.pack(fill=tk.X)
-
-# Status atual
-lbl_status = tk.Label(
-    progress_frame,
-    text="Aguardando execução...",
-    font=font_default,
-    bg=COLORS["bg_card"],
-    fg=COLORS["text_secondary"]
-)
-lbl_status.pack(pady=(5, 0), anchor="w")
-
-# Botão de execução manual
-action_frame = tk.Frame(status_card, bg=COLORS["bg_card"], pady=10)
-action_frame.pack(fill=tk.X)
-
-btn_generate = create_custom_button(
-    action_frame,
-    "Gerar Arquivo Agora",
-    manual_job,
-    width=200
-)
-btn_generate.pack(anchor="center", pady=(5, 0))
-
-# Rodapé
-footer_frame = tk.Frame(root, bg=COLORS["bg_main"], pady=10)
-footer_frame.pack(fill=tk.X, side=tk.BOTTOM)
-
-lbl_footer = tk.Label(
-    footer_frame,
-    text=f"© {datetime.now().year} • Gerador de Produtos v25.01",
-    font=("Segoe UI", 8),
-    bg=COLORS["bg_main"],
-    fg=COLORS["text_secondary"]
-)
-lbl_footer.pack()
-
-# Configuração de estilos para ttk
-style = ttk.Style()
-style.theme_use('clam')
-style.configure(
-    "TProgressbar",
-    troughcolor=COLORS["border"],
-    background=COLORS["primary"],
-    thickness=8
-)
-
-# Inicia o loop do agendador e da interface
-scheduler_loop()
-update_ui()
-root.mainloop()
+if __name__ == "__main__":
+    main()
